@@ -1,0 +1,88 @@
+version: "3.9"
+
+# ── Réseau interne ─────────────────────────────────────────────────────────────
+networks:
+  ytech_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+# ── Volumes persistants ────────────────────────────────────────────────────────
+volumes:
+  db_data:
+    driver: local
+  app_uploads:
+    driver: local
+
+# ── Services ───────────────────────────────────────────────────────────────────
+services:
+
+  # ── Base de données MariaDB ────────────────────────────────────────────────
+  db:
+    image: mariadb:11.3
+    container_name: ytech_db
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MARIADB_DATABASE:      ${DB_NAME}
+      MARIADB_USER:          ${DB_USER}
+      MARIADB_PASSWORD:      ${DB_PASS}
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - ytech_net
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # La base de données n'est PAS exposée sur l'hôte en prod
+    # Pour le dev, on peut décommenter la ligne suivante :
+    # ports:
+    #   - "3306:3306"
+
+  # ── Application Flask ──────────────────────────────────────────────────────
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: ytech_app
+    restart: unless-stopped
+    environment:
+      SECRET_KEY:      ${SECRET_KEY}
+      DB_HOST:         db
+      DB_NAME:         ${DB_NAME}
+      DB_USER:         ${DB_USER}
+      DB_PASS:         ${DB_PASS}
+      ADMIN_PASSWORD:  ${ADMIN_PASSWORD}
+      UPLOAD_FOLDER:   /app/uploads
+    volumes:
+      - app_uploads:/app/uploads
+    networks:
+      - ytech_net
+    depends_on:
+      db:
+        condition: service_healthy
+    # L'app n'est PAS exposée directement, Nginx fait le proxy
+
+  # ── Reverse proxy Nginx ────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: ytech_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - ytech_net
+    depends_on:
+      - app
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/nginx-health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

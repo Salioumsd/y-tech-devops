@@ -1,0 +1,6 @@
+.env
+*.pyc
+__pycache__/
+app/uploads/
+*.tar.gz
+.DS_Store

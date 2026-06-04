@@ -1,0 +1,204 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# .gitlab-ci.yml — Pipeline CI/CD Y-Tech
+#
+# Variables GitLab CI à configurer dans Settings > CI/CD > Variables :
+#   CI_REGISTRY_USER     — login GitLab Container Registry
+#   CI_REGISTRY_PASSWORD — token d'accès registry
+#   SSH_PRIVATE_KEY      — clé SSH pour se connecter au serveur de prod
+#   DEPLOY_HOST          — IP ou DNS du serveur de production
+#   DEPLOY_USER          — utilisateur SSH sur le serveur de prod
+#   DB_ROOT_PASSWORD     — mot de passe root MariaDB (secret)
+#   DB_PASS              — mot de passe utilisateur DB (secret)
+#   SECRET_KEY           — clé secrète Flask (secret)
+#   ADMIN_PASSWORD       — mot de passe admin initial (secret)
+# ─────────────────────────────────────────────────────────────────────────────
+
+stages:
+  - test
+  - build
+  - publish
+  - deploy
+
+variables:
+  IMAGE_NAME: $CI_REGISTRY_IMAGE/ytech-app
+  IMAGE_TAG:  $CI_COMMIT_SHORT_SHA
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+
+# ── Ancres YAML réutilisables ─────────────────────────────────────────────────
+.docker_login: &docker_login
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 1 — TEST
+# ─────────────────────────────────────────────────────────────────────────────
+lint:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - pip install --no-cache-dir flake8
+    - flake8 app/ --max-line-length=120 --exclude=app/static --count --statistics
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+unit_tests:
+  stage: test
+  image: python:3.12-slim
+  services:
+    - name: mariadb:11.3
+      alias: db
+      variables:
+        MARIADB_ROOT_PASSWORD: rootpass
+        MARIADB_DATABASE:      ytech_db
+        MARIADB_USER:          ytech
+        MARIADB_PASSWORD:      ytechpass
+  variables:
+    DB_HOST:     db
+    DB_NAME:     ytech_db
+    DB_USER:     ytech
+    DB_PASS:     ytechpass
+    SECRET_KEY:  test-secret-key
+    UPLOAD_FOLDER: /tmp/uploads
+  before_script:
+    - apt-get update -qq && apt-get install -qq -y default-libmysqlclient-dev gcc pkg-config
+    - pip install --no-cache-dir -r app/requirements.txt pytest
+  script:
+    - cd app
+    - python -c "from app import app, db, init_db; app.config['TESTING']=True; init_db(); print('DB init OK')"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 2 — BUILD
+# ─────────────────────────────────────────────────────────────────────────────
+build_image:
+  stage: build
+  image: docker:26
+  services:
+    - docker:26-dind
+  <<: *docker_login
+  script:
+    - |
+      docker build \
+        --cache-from "$IMAGE_NAME:latest" \
+        --tag "$IMAGE_NAME:$IMAGE_TAG" \
+        --tag "$IMAGE_NAME:latest" \
+        --label "build.commit=$CI_COMMIT_SHA" \
+        --label "build.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --label "build.pipeline=$CI_PIPELINE_ID" \
+        ./app
+    - docker save "$IMAGE_NAME:$IMAGE_TAG" | gzip > image.tar.gz
+  artifacts:
+    paths:
+      - image.tar.gz
+    expire_in: 1 hour
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 3 — PUBLISH
+# ─────────────────────────────────────────────────────────────────────────────
+push_image:
+  stage: publish
+  image: docker:26
+  services:
+    - docker:26-dind
+  <<: *docker_login
+  script:
+    - docker load < image.tar.gz
+    - docker push "$IMAGE_NAME:$IMAGE_TAG"
+    - docker push "$IMAGE_NAME:latest"
+    - echo "Image publiée → $IMAGE_NAME:$IMAGE_TAG"
+  dependencies:
+    - build_image
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 4 — DEPLOY
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Déploiement en staging (branche develop) — docker-compose
+deploy_staging:
+  stage: deploy
+  image: alpine:3.19
+  before_script:
+    - apk add --no-cache openssh-client rsync
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - ssh-keyscan -H $DEPLOY_HOST >> ~/.ssh/known_hosts
+  script:
+    - |
+      # Copier les fichiers de config sur le serveur staging
+      rsync -avz --exclude='.git' --exclude='__pycache__' \
+        docker-compose.yml nginx/ mysql-init/ \
+        $DEPLOY_USER@$DEPLOY_HOST:/opt/ytech-staging/
+      # Déployer via docker compose
+      ssh $DEPLOY_USER@$DEPLOY_HOST "
+        cd /opt/ytech-staging
+        docker login -u '$CI_REGISTRY_USER' -p '$CI_REGISTRY_PASSWORD' $CI_REGISTRY
+        export IMAGE_NAME=$IMAGE_NAME
+        export IMAGE_TAG=$IMAGE_TAG
+        export DB_ROOT_PASSWORD='$DB_ROOT_PASSWORD'
+        export DB_NAME=ytech_db
+        export DB_USER=ytech
+        export DB_PASS='$DB_PASS'
+        export SECRET_KEY='$SECRET_KEY'
+        export ADMIN_PASSWORD='$ADMIN_PASSWORD'
+        docker compose pull app
+        docker compose up -d --remove-orphans
+        docker system prune -f
+        echo 'Staging déployé OK'
+      "
+  environment:
+    name: staging
+    url: http://$DEPLOY_HOST
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+# Déploiement en production (branche main) — Docker Swarm
+deploy_production:
+  stage: deploy
+  image: alpine:3.19
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - ssh-keyscan -H $DEPLOY_HOST >> ~/.ssh/known_hosts
+  script:
+    - |
+      scp docker-stack.yml nginx/nginx.conf $DEPLOY_USER@$DEPLOY_HOST:/opt/ytech/
+      ssh $DEPLOY_USER@$DEPLOY_HOST "
+        cd /opt/ytech
+        docker login -u '$CI_REGISTRY_USER' -p '$CI_REGISTRY_PASSWORD' $CI_REGISTRY
+
+        # Créer les secrets Swarm s'ils n'existent pas encore
+        echo '$DB_ROOT_PASSWORD' | docker secret create db_root_password - 2>/dev/null || true
+        echo '$DB_PASS'          | docker secret create db_password        - 2>/dev/null || true
+        echo '$SECRET_KEY'       | docker secret create app_secret_key     - 2>/dev/null || true
+        echo '$ADMIN_PASSWORD'   | docker secret create admin_password      - 2>/dev/null || true
+
+        # Déployer / mettre à jour le stack Swarm
+        docker stack deploy \
+          --with-registry-auth \
+          --prune \
+          -c docker-stack.yml \
+          ytech
+
+        echo 'Production déployée — image: $IMAGE_NAME:$IMAGE_TAG'
+      "
+  environment:
+    name: production
+    url: http://$DEPLOY_HOST
+  when: manual   # Déclenchement manuel pour la production
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'

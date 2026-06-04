@@ -1,0 +1,138 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-stack.yml — déploiement Docker Swarm (production)
+# Usage :
+#   docker swarm init
+#   docker secret create db_root_password   <(echo "SuperSecret!")
+#   docker secret create db_password        <(echo "YtechPass!")
+#   docker secret create app_secret_key     <(echo "$(openssl rand -hex 32)")
+#   docker secret create admin_password     <(echo "Admin1234!")
+#   docker stack deploy -c docker-stack.yml ytech
+# ─────────────────────────────────────────────────────────────────────────────
+
+networks:
+  ytech_net:
+    driver: overlay
+    attachable: true
+
+volumes:
+  db_data:
+    driver: local
+  app_uploads:
+    driver: local
+
+secrets:
+  db_root_password:
+    external: true
+  db_password:
+    external: true
+  app_secret_key:
+    external: true
+  admin_password:
+    external: true
+
+services:
+
+  db:
+    image: mariadb:11.3
+    environment:
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+      MARIADB_DATABASE: ytech_db
+      MARIADB_USER:     ytech
+      MARIADB_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_root_password
+      - db_password
+    volumes:
+      - db_data:/var/lib/mysql
+    networks:
+      - ytech_net
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 3
+      placement:
+        constraints:
+          - node.role == manager   # La DB reste sur le manager pour la persistance
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  app:
+    image: registry.gitlab.com/${CI_PROJECT_PATH}/ytech-app:latest
+    environment:
+      DB_HOST:       db
+      DB_NAME:       ytech_db
+      DB_USER:       ytech
+      UPLOAD_FOLDER: /app/uploads
+      # Les secrets sont lus via les fichiers montés
+      SECRET_KEY_FILE:     /run/secrets/app_secret_key
+      DB_PASS_FILE:        /run/secrets/db_password
+      ADMIN_PASSWORD_FILE: /run/secrets/admin_password
+    secrets:
+      - app_secret_key
+      - db_password
+      - admin_password
+    volumes:
+      - app_uploads:/app/uploads
+    networks:
+      - ytech_net
+    deploy:
+      replicas: 2                  # Haute disponibilité : 2 réplicas
+      update_config:
+        parallelism: 1             # Mise à jour progressive (rolling update)
+        delay: 10s
+        failure_action: rollback
+        order: start-first         # Démarrer le nouveau avant d'arrêter l'ancien
+      rollback_config:
+        parallelism: 1
+        delay: 5s
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - target: 80
+        published: 80
+        mode: host
+    configs:
+      - source: nginx_config
+        target: /etc/nginx/conf.d/default.conf
+    networks:
+      - ytech_net
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+      resources:
+        limits:
+          memory: 64M
+
+configs:
+  nginx_config:
+    file: ./nginx/nginx.conf
